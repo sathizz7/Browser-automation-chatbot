@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=400, initial-scale=1.0">
+  <title>Browser Agent</title>
+  <link rel="stylesheet" href="popup.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="app">
+    <!-- Header -->
+    <header class="header">
+      <div class="header-left">
+        <div class="logo">🤖</div>
+        <div class="header-text">
+          <h1>Browser Agent</h1>
+          <span class="subtitle">AI Browser Automation</span>
+        </div>
+      </div>
+      <div class="status-indicator" id="statusDot" title="Disconnected">
+        <span class="dot"></span>
+        <span class="status-text" id="statusText">Offline</span>
+      </div>
+    </header>
+
+    <!-- Chat Area -->
+    <main class="chat-area" id="chatArea">
+      <div class="welcome-message">
+        <div class="welcome-icon">🚀</div>
+        <p>Hello! I'm your browser automation agent.</p>
+        <p class="welcome-sub">Tell me what to do on this page.</p>
+      </div>
+    </main>
+
+    <!-- Input Area -->
+    <footer class="input-area">
+      <div class="input-wrapper">
+        <input
+          type="text"
+          id="messageInput"
+          placeholder="Type your goal..."
+          autocomplete="off"
+          autofocus
+        >
+        <button id="sendBtn" title="Send">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="22" y1="2" x2="11" y2="13"></line>
+            <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+          </svg>
+        </button>
+      </div>
+    </footer>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
