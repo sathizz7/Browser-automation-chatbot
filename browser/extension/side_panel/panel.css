@@ -160,9 +160,17 @@ body {
   content: "...";
   animation: typing 1.5s infinite steps(4, end);
 }
+
 @keyframes typing {
-  0%, 100% { opacity: 0; }
-  50% { opacity: 1; }
+
+  0%,
+  100% {
+    opacity: 0;
+  }
+
+  50% {
+    opacity: 1;
+  }
 }
 
 /* Footer Input */
@@ -216,6 +224,21 @@ body {
 .send-btn:disabled {
   background: #cbd5e1;
   cursor: not-allowed;
+}
+
+/* Progress Steps (DOM agent action feedback) */
+.progress-step {
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 3px 14px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", monospace;
+  line-height: 1.5;
+  border-left: 2px solid #cbd5e1;
+  margin-left: 8px;
+}
+
+.progress-step .step-icon {
+  margin-right: 4px;
 }
 
 .hidden {

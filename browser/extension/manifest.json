@@ -7,11 +7,15 @@
         "sidePanel",
         "activeTab",
         "scripting",
-        "storage"
+        "storage",
+        "tabs"
     ],
     "host_permissions": [
         "<all_urls>",
-        "http://localhost:8000/*"
+        "http://localhost:8000/*",
+        "http://localhost:8001/*",
+        "http://127.0.0.1:8000/*",
+        "http://127.0.0.1:8001/*"
     ],
     "background": {
         "service_worker": "background/background.js"

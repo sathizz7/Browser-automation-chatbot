@@ -1,0 +1,267 @@
+# Frontend-Interactive Agent — Revised Architecture Plan
+
+> Addresses all 12 review points. Core principles: **Element Abstraction Layer**, **Multi-Step Planning**, **Loop Detection + Safety**.
+
+## Architecture: Planner–Executor with Element Abstraction
+
+```
+User → Side Panel → Content Script (DOM Reader) → Backend /plan (LLM Planner)
+                          ↑                              ↓
+                    DOM Executor  ←──── Action Plan (element IDs, not selectors)
+                          ↑
+                    State Observer (MutationObserver + network idle)
+```
+
+> [!IMPORTANT]
+> **Fully visible mode only.** No headless browser-use for interactive tasks. Browser-use is retained only as an optional fallback for multi-page discovery (e.g., finding a URL). All form filling, clicking, and OTP flows happen visibly in the user's tab.
+
+---
+
+## Core Design Decisions (Addressing All 12 Review Points)
+
+### 1. Element Abstraction Layer (Review #1, #12)
+
+Content script assigns **stable internal IDs** (`el_0`, `el_1`, ...) to each interactive element. The LLM **never sees raw selectors** — it references `element_id` only. Selector resolution stays browser-side.
+
+```json
+// Content script sends this to /plan:
+{
+  "elements": [
+    { "id": "el_0", "tag": "input", "type": "text", "label": "Mobile No. for OTP", 
+      "placeholder": "Mobile No. for OTP", "name": "txtMobile", "value": "", "visible": true },
+    { "id": "el_1", "tag": "button", "type": "submit", "text": "Send OTP", "visible": true }
+  ]
+}
+```
+
+```json
+// LLM returns this (element IDs, NOT selectors):
+{ "actions": [{ "type": "type", "element_id": "el_0", "value": "8248007169" }] }
+```
+
+**Selector priority** for internal mapping (most stable → least):
+[id](file:///d:/Mini-proj/ghmc/Browser-automation-chatbot/browser/extension/side_panel/panel.js#66-71) → [name](file:///d:/Mini-proj/ghmc/Browser-automation-chatbot/browser/backend/schemas.py#50-58) → `aria-label` → `data-testid` → `unique text` → `nth-of-type`
+
+### 2. Multi-Step Planning (Review #2)
+
+LLM outputs **batched action plans** — multiple steps in one response. Executor runs the full batch locally without calling backend between each step.
+
+```json
+{
+  "actions": [
+    { "type": "type", "element_id": "el_0", "value": "8248007169", "description": "Entering mobile number" },
+    { "type": "click", "element_id": "el_1", "description": "Clicking Send OTP" },
+    { "type": "wait", "condition": "dom_change", "timeout_ms": 3000, "description": "Waiting for OTP field" }
+  ],
+  "message": "Filling mobile number and sending OTP...",
+  "done": false,
+  "wait_for_user_input": "Please enter the OTP you received"
+}
+```
+
+**Backend is called again only when:**
+- All actions in the batch are executed
+- An action fails and needs replanning
+- `wait_for_user_input` resolves (user provides OTP)
+
+### 3. Filtered DOM Snapshots (Review #3)
+
+Only interactive elements are extracted. No layout divs, no hidden elements, no framework noise.
+
+**Include:** `input`, `button`, `select`, `textarea`, `a[href]` (visible only)  
+**Per element:** tag, type, id, name, label, placeholder, text, value, aria-label, visible, disabled  
+**Exclude:** hidden inputs, `display:none`, `visibility:hidden`, framework-generated wrappers  
+**Max elements:** Cap at 50 interactive elements per snapshot (with priority scoring)
+
+### 4. Loop Detection (Review #4)
+
+Track last 5 executed action plans. If the same action sequence repeats 2x:
+
+1. Inject a "nudge" into the next `/plan` call: `"loop_detected": true`
+2. If 3x: abort and ask user for clarification
+3. Log loop context for debugging
+
+### 5. State Observers (Review #6)
+
+After each action execution, the executor waits before reporting completion:
+
+```javascript
+async function waitForStable() {
+  await Promise.race([
+    waitForNetworkIdle(500),        // No pending XHR/fetch for 500ms
+    waitForMutationSettle(300),     // No DOM mutations for 300ms
+    timeout(3000)                   // Hard cap: 3 seconds
+  ]);
+}
+```
+
+Uses `MutationObserver` + `PerformanceObserver` for network tracking.
+
+### 6. Action Safety Layer (Review #7)
+
+**Allowed actions:** `type`, [click](file:///d:/Mini-proj/ghmc/Browser-automation-chatbot/browser/extension/side_panel/panel.js#176-177), `select`, `scroll`, `wait`, [navigate](file:///d:/Mini-proj/ghmc/Browser-automation-chatbot/browser/backend/prompts.py#126-148), `done`
+
+**Blocked by default (require explicit user confirmation):**
+- Password fields (`type="password"`)
+- Payment fields (card number, CVV)
+- Delete/destructive actions (text matching: "delete", "remove account")
+- File upload inputs
+
+**Content script enforces this — backend cannot bypass it.**
+
+### 7. OTP Detection (Review #8)
+
+Rule-based detection in the content script (not LLM-dependent):
+
+```javascript
+function isOtpField(el) {
+  const hints = [el.name, el.id, el.placeholder, el.getAttribute('aria-label')].join(' ').toLowerCase();
+  return (
+    hints.includes('otp') ||
+    hints.includes('verification') ||
+    (el.maxLength >= 4 && el.maxLength <= 8 && el.type === 'text') ||
+    el.getAttribute('pattern')?.includes('[0-9]')
+  );
+}
+```
+
+When detected: Executor pauses, reports to panel, panel asks user for OTP.
+
+### 8. Human-Like Event Simulation (Review #10)
+
+```javascript
+async function simulateType(element, text) {
+  element.focus();
+  element.value = '';
+  element.dispatchEvent(new Event('focus', { bubbles: true }));
+  
+  for (const char of text) {
+    element.dispatchEvent(new KeyboardEvent('keydown', { key: char, bubbles: true }));
+    element.value += char;
+    element.dispatchEvent(new InputEvent('input', { data: char, bubbles: true }));
+    element.dispatchEvent(new KeyboardEvent('keyup', { key: char, bubbles: true }));
+    await delay(50 + Math.random() * 80); // 50-130ms jitter
+  }
+  element.dispatchEvent(new Event('change', { bubbles: true }));
+}
+```
+
+### 9. Planner JSON Enforcement (Review #11)
+
+Backend planner uses **Pydantic schema validation** on LLM output. System prompt specifies `response_format`. If LLM returns non-JSON, backend retries once with a stricter prompt.
+
+### 10. No Hybrid Headless (Review #9)
+
+**Decision: Fully visible agent for all interactive tasks.**
+
+Browser-use headless is retained ONLY for:
+- URL discovery (e.g., "find the function hall booking page") → returns URL → extension navigates visibly
+- Background scraping tasks where visibility is irrelevant
+
+All form filling, clicking, OTP flows → **content script executor only**.
+
+---
+
+## File Changes
+
+### Backend
+
+#### [NEW] [planner.py](file:///d:/Mini-proj/ghmc/Browser-automation-chatbot/browser/backend/planner.py)
+- `plan_actions(message, dom_snapshot, session_context)` → `PlanResponse`
+- System prompt enforces JSON output with `element_id` references
+- Session context tracks conversation + previous actions for multi-turn flows
+- Loop detection: checks `action_history` for repetition
+
+#### [MODIFY] [schemas.py](file:///d:/Mini-proj/ghmc/Browser-automation-chatbot/browser/backend/schemas.py)
+New schemas:
+- `DOMElement`: `{ id, tag, type, label, placeholder, text, name, value, visible, disabled }`
+- `DOMAction`: `{ type, element_id, value, description, condition, timeout_ms }`
+- `PlanRequest`: `{ message, elements: DOMElement[], page_url, session_id, action_history, loop_detected }`
+- `PlanResponse`: `{ actions: DOMAction[], message, done, wait_for_user_input }`
+
+#### [MODIFY] [main.py](file:///d:/Mini-proj/ghmc/Browser-automation-chatbot/browser/backend/main.py)
+- Add `POST /plan` endpoint (calls `planner.plan_actions()`)
+- Keep `POST /chat` for conversational Q&A
+- Keep `POST /automate` as fallback for headless URL discovery
+
+---
+
+### Extension
+
+#### [MODIFY] [content.js](file:///d:/Mini-proj/ghmc/Browser-automation-chatbot/browser/extension/content_scripts/content.js)
+Major rewrite — three responsibilities:
+
+1. **Element Abstraction Layer**: Extracts interactive elements with stable IDs, filtered and prioritized
+2. **DOM Action Executor**: Receives `DOMAction[]`, resolves `element_id` → DOM element, executes with human-like events + visual highlight
+3. **State Observer**: `MutationObserver` + network idle detection, waits for DOM stability between actions
+
+Message handlers:
+- `GET_DOM_SNAPSHOT` → returns `{ elements[], page_url, title }`
+- `EXECUTE_ACTIONS` → executes action batch, returns `{ results[], new_snapshot }`
+
+#### [MODIFY] [panel.js](file:///d:/Mini-proj/ghmc/Browser-automation-chatbot/browser/extension/side_panel/panel.js)
+New orchestration loop:
+1. Get DOM snapshot from content script
+2. Send `POST /plan` with `{ message, elements, action_history }`
+3. Receive `PlanResponse` → forward actions to content script
+4. Content script executes + returns results
+5. If `done: false` → loop (with new snapshot)
+6. If `wait_for_user_input` → pause, show prompt in chat
+7. Loop detection: track action_history, send flag if repeated
+8. Show step-by-step progress in chat bubbles
+
+#### [MODIFY] [panel.html](file:///d:/Mini-proj/ghmc/Browser-automation-chatbot/browser/extension/side_panel/panel.html)
+- Add step progress indicator (collapsible)
+- Add OTP input prompt component
+
+---
+
+## Communication Flow
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant P as Side Panel
+    participant CS as Content Script
+    participant B as Backend /plan
+
+    U->>P: "fill mobile 8248007169 and send OTP"
+    P->>CS: GET_DOM_SNAPSHOT
+    CS-->>P: {elements: [{id:el_0, label:Mobile}, {id:el_1, text:Send OTP}]}
+    P->>B: POST /plan {message, elements, history:[]}
+    B-->>P: {actions: [type el_0, click el_1, wait dom_change], done:false, wait:"Enter OTP"}
+    P->>CS: EXECUTE_ACTIONS [type, click, wait]
+    CS-->>CS: Types "8248007169" visibly, clicks Send OTP, waits for DOM
+    CS-->>P: {results: [ok,ok,ok], new_snapshot}
+    P->>U: "OTP sent! Please enter the OTP you received:"
+    U->>P: "482916"
+    P->>CS: GET_DOM_SNAPSHOT
+    CS-->>P: {elements: [{id:el_5, label:OTP, otp_detected:true}]}
+    P->>B: POST /plan {message:"otp 482916", elements, history}
+    B-->>P: {actions: [type el_5 "482916"], done:true}
+    P->>CS: EXECUTE_ACTIONS [type]
+    CS-->>CS: Types OTP visibly
+    P->>U: "✅ OTP entered!"
+```
+
+---
+
+## Verification Plan
+
+### Automated
+```bash
+# Backend planner unit test
+curl -X POST http://localhost:8000/plan -d '{"message":"fill mobile","elements":[{"id":"el_0","tag":"input","label":"Mobile"}]}'
+# Expect: JSON with actions referencing el_0
+```
+
+### Manual E2E
+1. Open GHMC Function Hall Booking in Chrome
+2. Open side panel → "fill my mobile number 8248007169 and click send OTP"
+3. **Verify**: Agent types visibly into mobile field, clicks Send OTP
+4. Agent pauses → "Enter OTP"
+5. User types OTP → agent fills it visibly
+
+### Latency Target
+- Single batch (3 actions): < 5 seconds total
+- Multi-batch flow (6 actions): < 12 seconds total
