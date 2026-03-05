@@ -70,7 +70,14 @@ sendBtn.addEventListener("click", sendMessage);
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     switch (message.type) {
         case "agent_message":
+            // Remove any pending status message
+            removeStatusMessage();
             appendMessage("agent", message.payload?.text || "...");
+            break;
+
+        case "agent_status":
+            // Real-time status update (Plan/Act/Evaluate indicators)
+            showStatusMessage(message.payload?.text || "Working...");
             break;
 
         case "system":
@@ -78,6 +85,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             break;
 
         case "error":
+            removeStatusMessage();
             appendMessage("error", message.payload?.message || "An error occurred");
             break;
 
@@ -141,3 +149,32 @@ statusDot.addEventListener("click", () => {
         statusText.textContent = "Connecting...";
     }
 });
+
+// ─────────────────────────────────────────────
+// Status message handling (real-time agent updates)
+// ─────────────────────────────────────────────
+function showStatusMessage(text) {
+    // Remove existing status message first
+    removeStatusMessage();
+
+    // Remove welcome message if present
+    const welcome = chatArea.querySelector(".welcome-message");
+    if (welcome) welcome.remove();
+
+    const statusEl = document.createElement("div");
+    statusEl.className = "message agent status-message";
+    statusEl.id = "agentStatus";
+
+    const bubble = document.createElement("div");
+    bubble.className = "message-bubble status-bubble";
+    bubble.textContent = text;
+
+    statusEl.appendChild(bubble);
+    chatArea.appendChild(statusEl);
+    chatArea.scrollTop = chatArea.scrollHeight;
+}
+
+function removeStatusMessage() {
+    const existing = document.getElementById("agentStatus");
+    if (existing) existing.remove();
+}

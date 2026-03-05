@@ -1,9 +1,16 @@
 /**
- * Background Service Worker
- * - Maintains persistent WebSocket connection to FastAPI backend
- * - Relays messages between popup <-> backend <-> content script
- * - Routes DOM snapshot requests and action commands to content scripts
- * - Handles reconnection with exponential backoff
+ * Background Service Worker — Thin Client (Playwright-Powered Backend)
+ *
+ * The backend now controls the browser directly via Playwright.
+ * This background script only does:
+ * 1. WebSocket connection to FastAPI (for sending goals + receiving status)
+ * 2. Toolbar icon click → toggle panel
+ * 3. Routes agent messages/status to the content script panel
+ *
+ * REMOVED (now handled by Playwright backend):
+ * - DOM snapshot requests
+ * - Action execution relay
+ * - Navigation handling
  */
 
 const WS_URL = "ws://localhost:8000/ws";
@@ -25,55 +32,42 @@ function connectWebSocket() {
 
     ws.onopen = () => {
         console.log("[BG] WebSocket connected");
-        reconnectDelay = 1000; // Reset backoff
-        // Notify popup that connection is ready
-        broadcastToPopup({ type: "connection_status", payload: { connected: true } });
+        reconnectDelay = 1000;
+        broadcastToPanel({ type: "connection_status", payload: { connected: true } });
     };
 
     ws.onmessage = (event) => {
         try {
             const data = JSON.parse(event.data);
-            console.log("[BG] Received from server:", data.type);
+            console.log("[BG] From server:", data.type);
 
-            // Store session ID from system welcome message
+            // Store session ID
             if (data.type === "system" && data.payload?.session_id) {
                 sessionId = data.payload.session_id;
             }
 
-            // Route action commands from server to content script
-            if (data.type === "execute_action") {
-                sendToContentScript(data.payload);
-                return;
-            }
+            // Forward everything to the panel
+            // (agent_message, agent_status, system, error, etc.)
+            broadcastToPanel(data);
 
-            // Route DOM snapshot requests from server to content script
-            if (data.type === "request_dom_snapshot") {
-                requestDOMSnapshot();
-                return;
-            }
-
-            // Forward all other server messages to popup
-            broadcastToPopup(data);
         } catch (err) {
             console.error("[BG] Failed to parse server message:", err);
         }
     };
 
     ws.onclose = (event) => {
-        console.log("[BG] WebSocket closed:", event.code, event.reason);
+        console.log("[BG] WebSocket closed:", event.code);
         ws = null;
-        broadcastToPopup({ type: "connection_status", payload: { connected: false } });
+        broadcastToPanel({ type: "connection_status", payload: { connected: false } });
         scheduleReconnect();
     };
 
-    ws.onerror = (error) => {
-        console.error("[BG] WebSocket error:", error);
+    ws.onerror = () => {
         ws?.close();
     };
 }
 
 function scheduleReconnect() {
-    console.log(`[BG] Reconnecting in ${reconnectDelay}ms...`);
     setTimeout(() => {
         connectWebSocket();
         reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
@@ -83,164 +77,93 @@ function scheduleReconnect() {
 function sendToServer(message) {
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify(message));
-        console.log("[BG] Sent to server:", message.type);
     } else {
-        console.warn("[BG] WebSocket not connected, cannot send");
-        broadcastToPopup({
+        broadcastToPanel({
             type: "error",
-            payload: { message: "Not connected to backend. Retrying..." },
+            payload: { message: "⚠️ Backend not running. Start the backend server." },
         });
         connectWebSocket();
     }
 }
 
 // ─────────────────────────────────────────────
-// Message Routing: Popup <-> Background <-> Server
+// Toolbar icon click → toggle panel
+// ─────────────────────────────────────────────
+
+chrome.action.onClicked.addListener(async (tab) => {
+    if (!tab?.id) return;
+    chrome.tabs.sendMessage(tab.id, { type: "toggle_panel" }).catch(() => { });
+});
+
+// ─────────────────────────────────────────────
+// Message routing: Panel → Background → Server
 // ─────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    console.log("[BG] Message from popup/content:", message.type);
-
     switch (message.type) {
-        case "user_message":
-            // Grab DOM snapshot first, then send both to backend
-            requestDOMSnapshot().then((snapshot) => {
-                sendToServer({
-                    type: "user_message",
-                    payload: {
-                        text: message.payload.text,
-                        page_context: snapshot || null,
-                    },
-                });
-                sendResponse({ status: "sent" });
-            });
-            return true; // async
 
-        case "get_dom_snapshot":
-            // Popup requested a snapshot directly
-            requestDOMSnapshot().then((snapshot) => {
-                sendResponse(snapshot);
+        case "user_message":
+            // Send the user's goal to the backend
+            // No DOM snapshot — Playwright scrapes the page directly
+            sendToServer({
+                type: "user_message",
+                payload: {
+                    text: message.payload.text,
+                    page_context: message.payload.page_context || null,
+                },
             });
-            return true; // async
+            sendResponse({ status: "sent" });
+            break;
 
         case "get_status":
-            // Return connection status
             sendResponse({
                 connected: ws && ws.readyState === WebSocket.OPEN,
-                sessionId: sessionId,
+                sessionId,
             });
             break;
 
         case "reconnect":
-            // Force reconnect
             ws?.close();
             connectWebSocket();
             sendResponse({ status: "reconnecting" });
             break;
 
-        case "dom_changed":
-            // Content script reports DOM mutation
-            console.log("[BG] DOM changed on:", message.payload?.url);
-            sendResponse({ received: true });
-            break;
-
-        case "action_result":
-            // Content script returns action execution result
-            console.log("[BG] Action result:", message.payload);
-            sendToServer({
-                type: "action_result",
-                payload: message.payload,
-            });
-            sendResponse({ received: true });
-            break;
-
         default:
-            // Forward any other messages to server
             sendToServer(message);
             sendResponse({ status: "forwarded" });
     }
 
-    return true; // Keep message channel open for async response
+    return true;
 });
 
 // ─────────────────────────────────────────────
-// Broadcast to Popup
+// Broadcast to panel (via content script)
 // ─────────────────────────────────────────────
 
-function broadcastToPopup(message) {
-    chrome.runtime.sendMessage(message).catch(() => {
-        // Popup might be closed — that's fine
-    });
-}
-
-// ─────────────────────────────────────────────
-// Content Script Communication
-// ─────────────────────────────────────────────
-
-/**
- * Request DOM snapshot from the active tab's content script.
- * Returns the snapshot data or null on failure.
- */
-async function requestDOMSnapshot() {
+async function broadcastToPanel(message) {
     try {
-        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (!tab?.id) {
-            console.warn("[BG] No active tab found");
-            return null;
-        }
-        return new Promise((resolve) => {
-            chrome.tabs.sendMessage(tab.id, { type: "get_dom_snapshot" }, (response) => {
-                if (chrome.runtime.lastError) {
-                    console.warn("[BG] Content script not ready:", chrome.runtime.lastError.message);
-                    resolve(null);
-                } else {
-                    resolve(response);
-                }
-            });
-        });
-    } catch (err) {
-        console.error("[BG] Error requesting DOM snapshot:", err);
-        return null;
-    }
-}
-
-/**
- * Send an action command to the active tab's content script.
- */
-async function sendToContentScript(actionPayload) {
-    try {
-        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (!tab?.id) {
-            console.warn("[BG] No active tab for action");
-            sendToServer({ type: "action_result", payload: { success: false, error: "No active tab" } });
-            return;
-        }
-        chrome.tabs.sendMessage(tab.id, { type: "execute_action", payload: actionPayload }, (result) => {
-            if (chrome.runtime.lastError) {
-                sendToServer({
-                    type: "action_result",
-                    payload: { success: false, error: chrome.runtime.lastError.message },
-                });
-            } else {
-                sendToServer({ type: "action_result", payload: result });
+        const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+        for (const tab of tabs) {
+            if (tab?.id) {
+                chrome.tabs.sendMessage(tab.id, message).catch(() => { });
             }
-        });
-    } catch (err) {
-        sendToServer({ type: "action_result", payload: { success: false, error: err.message } });
-    }
+        }
+    } catch { }
+
+    // Also forward to any open popup
+    chrome.runtime.sendMessage(message).catch(() => { });
 }
 
 // ─────────────────────────────────────────────
-// Initialize on service worker start
+// Init
 // ─────────────────────────────────────────────
 
 connectWebSocket();
 
-// Keep the service worker alive by setting up an alarm
-chrome.alarms?.create("keepAlive", { periodInMinutes: 0.5 });
+// Keep service worker alive
+chrome.alarms?.create("keepAlive", { periodInMinutes: 0.4 });
 chrome.alarms?.onAlarm.addListener((alarm) => {
     if (alarm.name === "keepAlive") {
-        // Ping to keep WS alive
         if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: "ping", payload: {} }));
         } else {

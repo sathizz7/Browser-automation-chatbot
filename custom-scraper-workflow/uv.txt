@@ -1,0 +1,4 @@
+ pip install uv                                                                      
+  uv venv --python 3.11                                                               
+  .\.venv\Scripts\activate                                                            
+  uv sync                                                                             

@@ -172,8 +172,15 @@ body {
 }
 
 @keyframes fadeIn {
-  from { opacity: 0; transform: translateY(6px); }
-  to { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .message.user {
@@ -302,4 +309,30 @@ body {
   opacity: 0.4;
   cursor: not-allowed;
   transform: none;
+}
+
+/* Status Bubble (real-time agent updates) */
+.status-message {
+  animation: fadeIn 0.2s ease;
+}
+
+.status-bubble {
+  background: rgba(108, 92, 231, 0.1) !important;
+  border: 1px solid rgba(108, 92, 231, 0.2) !important;
+  color: var(--accent-light) !important;
+  font-size: 12px !important;
+  padding: 8px 14px !important;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.6;
+  }
 }
