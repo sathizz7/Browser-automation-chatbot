@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
-from planner import plan_actions
+from planner import plan_actions, clear_session, list_sessions
 from schemas import PlanRequest, PlanResponse
 
 # ── Logging ────────────────────────────────────────────────
@@ -96,3 +96,21 @@ async def plan_endpoint(req: PlanRequest):
         f"done={result.done}, wait='{result.wait_for_user_input[:50]}'"
     )
     return result
+
+
+@app.post("/reset")
+async def reset_session(session_id: str = "default"):
+    """Clear memory for a session so the planner starts fresh.
+
+    Call this when the user starts a new task on a new page.
+    """
+    existed = clear_session(session_id)
+    logger.info(f"POST /reset — session_id='{session_id}', existed={existed}")
+    return {"status": "ok", "session_id": session_id, "was_active": existed}
+
+
+@app.get("/sessions")
+async def get_sessions():
+    """List all active sessions (for debugging)."""
+    sessions = list_sessions()
+    return {"sessions": sessions, "count": len(sessions)}

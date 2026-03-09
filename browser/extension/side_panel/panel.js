@@ -205,6 +205,19 @@ async function executeActions(actions) {
     });
 }
 
+// ── Session Reset ───────────────────────────────────────
+
+async function resetSession() {
+    try {
+        await fetch(`${DOM_AGENT_URL}/reset?session_id=${encodeURIComponent(currentSessionId)}`, {
+            method: "POST",
+        });
+        console.log(`[DOM Agent] Session '${currentSessionId}' reset.`);
+    } catch (err) {
+        console.warn("[DOM Agent] Could not reset session:", err.message);
+    }
+}
+
 // ── Loop Detection ──────────────────────────────────────
 
 function detectLoop(newActions) {
@@ -230,6 +243,10 @@ async function runDomAgent(userMessage) {
         return;
     }
     isAutomating = true;
+
+    // Reset session memory for a fresh task
+    currentSessionId = "sess_" + Math.random().toString(36).substr(2, 9);
+    actionHistory = [];
 
     try {
         let message = userMessage;
@@ -377,60 +394,8 @@ async function handleChat(messageText) {
     appendMessage("user", messageText);
     chatInput.value = "";
 
-    // Detect if this is an action request (fill, click, navigate, type, send, submit, etc.)
-    const actionKeywords = /\b(fill|click|type|submit|send|navigate|go to|open|enter|select|book|register|check.?out)\b/i;
-    const isAction = actionKeywords.test(messageText);
-
-    if (isAction && currentPageContext) {
-        // Route to DOM agent
-        await runDomAgent(messageText);
-    } else {
-        // Route to chat API
-        const loadingDiv = appendMessage("system", "", true);
-        try {
-            const data = await apiCall("/chat", {
-                message: messageText,
-                session_id: currentSessionId,
-                page_url: currentPageContext?.url || "",
-                page_context: currentPageContext,
-            });
-            removeLoading();
-
-            // Check for navigation URL
-            const urlMatch = data.message.match(/Final URL:\s*(https?:\/\/[^\s]+)/i);
-            if (urlMatch) {
-                const targetUrl = urlMatch[1];
-                appendHtml(
-                    "system",
-                    `✅ Found it! Navigating to:<br>
-                    <a href="${targetUrl}" style="color:#2563eb; text-decoration:underline; word-break:break-all;">${targetUrl}</a>`
-                );
-                const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-                if (tab) chrome.tabs.update(tab.id, { url: targetUrl });
-            } else {
-                appendMessage("system", data.message);
-            }
-
-            // Suggested actions
-            if (data.suggested_actions && data.suggested_actions.length > 0) {
-                const sugDiv = document.createElement("div");
-                sugDiv.className = "quick-actions";
-                sugDiv.style.padding = "4px 0";
-                data.suggested_actions.forEach((action) => {
-                    const btn = document.createElement("button");
-                    btn.className = "action-btn";
-                    btn.textContent = action;
-                    btn.onclick = () => handleChat(action);
-                    sugDiv.appendChild(btn);
-                });
-                chatContainer.appendChild(sugDiv);
-            }
-        } catch (err) {
-            console.error("Chat error:", err);
-            removeLoading();
-            appendMessage("system", `Error: ${err.message}`);
-        }
-    }
+    // All messages go to the DOM agent planner
+    await runDomAgent(messageText);
 }
 
 // ── Event Listeners ─────────────────────────────────────

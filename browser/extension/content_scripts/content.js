@@ -28,7 +28,50 @@
         return delay(min + Math.random() * (max - min));
     }
 
-    // ── 1. ELEMENT ABSTRACTION LAYER ────────────────────────
+    // ── 1. PERCEPTION ENGINE (Element Abstraction + Ranking + Context) ────
+
+    /**
+     * Simple non-crypto hash for generating stable element IDs.
+     * Uses djb2 algorithm — fast, deterministic, low collision.
+     */
+    function hashString(str) {
+        let hash = 5381;
+        for (let i = 0; i < str.length; i++) {
+            hash = ((hash << 5) + hash + str.charCodeAt(i)) & 0xffffffff;
+        }
+        return (hash >>> 0).toString(16).substring(0, 6);
+    }
+
+    /**
+     * Generate a stable, human-readable element ID that survives DOM reorderings.
+     * Format: "tag_readableHint_hash", e.g. "input_mobile_3a8f2c" or "btn_send_otp_7d2ea1"
+     */
+    function generateStableId(el) {
+        const tag = el.tagName.toLowerCase();
+        const name = el.name || "";
+        const label = findLabel(el);
+        const placeholder = el.placeholder || "";
+        const text = (el.innerText || el.textContent || "").trim().substring(0, 50);
+        const ariaLabel = el.getAttribute("aria-label") || "";
+
+        // Build hash from stable properties (NOT affected by DOM order)
+        const hashInput = [tag, name, label, placeholder, text, ariaLabel].join("|");
+        const hash = hashString(hashInput);
+
+        // Build a readable prefix
+        const hint = (label || placeholder || text || name || tag)
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, "_")
+            .replace(/^_|_$/g, "")
+            .substring(0, 20);
+
+        const prefix = tag === "input" || tag === "textarea" ? "input" :
+            tag === "button" || (tag === "input" && el.type === "submit") ? "btn" :
+                tag === "select" ? "sel" :
+                    tag === "a" ? "link" : tag;
+
+        return `${prefix}_${hint || "el"}_${hash}`;
+    }
 
     /**
      * Check if an element is truly visible on the page.
@@ -41,6 +84,20 @@
         }
         const rect = el.getBoundingClientRect();
         return rect.width > 0 && rect.height > 0;
+    }
+
+    /**
+     * Check if an element is currently in (or near) the viewport.
+     */
+    function isInViewport(el) {
+        const rect = el.getBoundingClientRect();
+        const margin = 200; // pixels of margin around viewport
+        return (
+            rect.top < (window.innerHeight + margin) &&
+            rect.bottom > -margin &&
+            rect.left < (window.innerWidth + margin) &&
+            rect.right > -margin
+        );
     }
 
     /**
@@ -57,14 +114,56 @@
         if (parentLabel) return parentLabel.innerText.trim();
         // aria-label
         if (el.getAttribute("aria-label")) return el.getAttribute("aria-label");
-        // Nearby text (previous sibling or parent)
+        // Nearby text (previous sibling)
         const prev = el.previousElementSibling;
         if (prev && prev.tagName === "LABEL") return prev.innerText.trim();
         return "";
     }
 
     /**
-     * Detect if an input is likely an OTP field (rule-based, not LLM-dependent).
+     * Find semantic context around an element:
+     * - Parent form title / legend
+     * - Closest section heading (h1-h4)
+     * - Fieldset legend
+     */
+    function findContext(el) {
+        const parts = [];
+
+        // 1. Parent <form> title — check for a heading inside the form
+        const form = el.closest("form");
+        if (form) {
+            const formHeading = form.querySelector("h1, h2, h3, h4, legend, .form-title, .card-header");
+            if (formHeading) parts.push(formHeading.innerText.trim().substring(0, 60));
+        }
+
+        // 2. Fieldset legend
+        const fieldset = el.closest("fieldset");
+        if (fieldset) {
+            const legend = fieldset.querySelector("legend");
+            if (legend) parts.push(legend.innerText.trim().substring(0, 40));
+        }
+
+        // 3. Walk up to find nearest preceding heading (h1-h4)
+        let node = el;
+        for (let i = 0; i < 15 && node; i++) {
+            node = node.previousElementSibling || node.parentElement;
+            if (node && /^H[1-4]$/.test(node.tagName)) {
+                parts.push(node.innerText.trim().substring(0, 60));
+                break;
+            }
+        }
+
+        // 4. Page title fallback (if we found nothing)
+        if (parts.length === 0) {
+            parts.push(document.title.substring(0, 60));
+        }
+
+        // Deduplicate and join with arrow
+        return [...new Set(parts)].join(" → ");
+    }
+
+    /**
+     * Detect if an input is likely an OTP field (rule-based).
      */
     function isOtpField(el) {
         const hints = [
@@ -77,17 +176,49 @@
         if (hints.includes("otp") || hints.includes("verification") || hints.includes("verify")) {
             return true;
         }
-        // Short numeric-only input
         const maxLen = el.maxLength;
         const pattern = el.getAttribute("pattern");
         if (maxLen >= 4 && maxLen <= 8 && el.type === "text") return true;
         if (pattern && pattern.includes("[0-9]")) return true;
-
         return false;
     }
 
     /**
-     * Build a stable selector for an element (for internal use only — never sent to LLM).
+     * Score an element's relevance to the user's intent message.
+     * Higher score = more likely to be what the user wants to interact with.
+     */
+    function scoreElement(el, metadata, userMessage) {
+        let score = 0;
+        if (!userMessage) return score;
+
+        const keywords = userMessage.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+        const label = (metadata.label || "").toLowerCase();
+        const placeholder = (metadata.placeholder || "").toLowerCase();
+        const text = (metadata.text || "").toLowerCase();
+        const name = (metadata.name || "").toLowerCase();
+
+        for (const kw of keywords) {
+            if (label.includes(kw)) score += 5;
+            if (placeholder.includes(kw)) score += 4;
+            if (text.includes(kw)) score += 3;
+            if (name.includes(kw)) score += 2;
+        }
+
+        // Bonus for viewport proximity
+        if (isInViewport(el)) score += 2;
+
+        // Bonus for clickable elements
+        const tag = el.tagName.toLowerCase();
+        if (tag === "button" || tag === "a" || el.type === "submit") score += 1;
+
+        // Bonus for OTP fields if user mentions OTP
+        if (metadata.otp_detected && userMessage.toLowerCase().includes("otp")) score += 6;
+
+        return score;
+    }
+
+    /**
+     * Build a stable CSS selector for an element (internal use — never sent to LLM).
      */
     function buildSelector(el) {
         if (el.id) return `#${CSS.escape(el.id)}`;
@@ -98,7 +229,6 @@
         if (el.getAttribute("data-testid")) {
             return `[data-testid="${CSS.escape(el.getAttribute("data-testid"))}"]`;
         }
-        // Fallback: nth-of-type from parent
         const parent = el.parentElement;
         if (parent) {
             const siblings = Array.from(parent.querySelectorAll(`:scope > ${el.tagName.toLowerCase()}`));
@@ -109,42 +239,65 @@
     }
 
     /**
-     * Extract all interactive elements from the page.
-     * Returns an element map { el_N: { metadata, domRef } }.
+     * Extract all interactive elements from the page with stable IDs,
+     * context enrichment, and intent-based ranking.
+     *
+     * @param {string} userMessage — (optional) user's task description for ranking
+     * @returns {{ [stableId]: { metadata + _selector + _domRef } }}
      */
-    function extractElements() {
+    function extractElements(userMessage = "") {
         const selectors = "input, button, select, textarea, a[href]";
         const allElements = document.querySelectorAll(selectors);
-        const elementMap = {};
-        let idx = 0;
+        const candidates = [];
+        const seenIds = new Set();
 
         for (const el of allElements) {
-            if (idx >= CONFIG.maxElements) break;
-
-            // Skip hidden, disabled-hidden, or non-interactive
             if (!isVisible(el)) continue;
             const type = el.getAttribute("type") || el.tagName.toLowerCase();
-            if (["hidden", "submit"].includes(type) && el.tagName === "INPUT") continue;
+            if (["hidden"].includes(type) && el.tagName === "INPUT") continue;
 
-            const id = `el_${idx}`;
-            elementMap[id] = {
-                id: id,
+            let stableId = generateStableId(el);
+            // Handle rare hash collisions
+            if (seenIds.has(stableId)) {
+                stableId += "_" + seenIds.size;
+            }
+            seenIds.add(stableId);
+
+            const label = findLabel(el);
+            const metadata = {
+                id: stableId,
                 tag: el.tagName.toLowerCase(),
                 type: type,
-                label: findLabel(el),
+                label: label,
                 placeholder: el.placeholder || "",
                 text: (el.innerText || el.textContent || "").trim().substring(0, 100),
                 name: el.name || "",
                 value: el.value || "",
                 ariaLabel: el.getAttribute("aria-label") || "",
+                context: findContext(el),
                 visible: true,
                 disabled: el.disabled || false,
                 otp_detected: isOtpField(el),
-                // Internal only — never sent to LLM
+            };
+
+            const score = scoreElement(el, metadata, userMessage);
+
+            candidates.push({
+                ...metadata,
+                _score: score,
                 _selector: buildSelector(el),
                 _domRef: el,
-            };
-            idx++;
+            });
+        }
+
+        // Sort by score descending, then cap at maxElements
+        candidates.sort((a, b) => b._score - a._score);
+        const topN = candidates.slice(0, CONFIG.maxElements);
+
+        // Build element map keyed by stable ID
+        const elementMap = {};
+        for (const entry of topN) {
+            elementMap[entry.id] = entry;
         }
 
         return elementMap;
@@ -171,22 +324,36 @@
     let currentElementMap = {};
 
     /**
-     * Resolve an element_id to a live DOM element.
+     * Resolve a stable element_id to a live DOM element.
+     * Tries: cached DOM ref → CSS selector → re-extract and match by ID.
      */
     function resolveElement(elementId) {
         const entry = currentElementMap[elementId];
-        if (!entry) return null;
+        if (!entry) {
+            // Element not in current map — try re-extracting
+            console.warn(`[DOM Agent] Element ${elementId} not in map, re-extracting...`);
+            currentElementMap = extractElements();
+            const retryEntry = currentElementMap[elementId];
+            if (retryEntry && retryEntry._domRef && document.contains(retryEntry._domRef)) {
+                return retryEntry._domRef;
+            }
+            return null;
+        }
 
         // First try the cached DOM ref
         if (entry._domRef && document.contains(entry._domRef)) {
             return entry._domRef;
         }
-        // Fallback: re-query by selector
+        // Fallback: re-query by CSS selector
         try {
-            return document.querySelector(entry._selector);
-        } catch {
-            return null;
-        }
+            const found = document.querySelector(entry._selector);
+            if (found) return found;
+        } catch { /* ignore selector errors */ }
+
+        // Last resort: re-extract and look up again
+        currentElementMap = extractElements();
+        const refreshed = currentElementMap[elementId];
+        return refreshed?._domRef || null;
     }
 
     /**
@@ -431,7 +598,7 @@
             return;
         }
 
-        // New: DOM snapshot with element abstraction
+        // V2: DOM snapshot with Perception Engine (stable IDs + context)
         if (request.type === "GET_DOM_SNAPSHOT") {
             // Update config if provided
             if (request.config) {

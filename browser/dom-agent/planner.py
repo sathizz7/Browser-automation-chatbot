@@ -1,7 +1,7 @@
-"""LLM-based DOM action planner.
+"""LLM-based DOM action planner with session memory.
 
-Receives a DOM snapshot (abstracted elements) + user message and returns
-a list of DOMActions that the content script should execute visibly.
+Uses LangChain's InMemoryChatMessageHistory + RunnableWithMessageHistory
+to keep conversation context across /plan calls within a session.
 """
 from __future__ import annotations
 
@@ -15,7 +15,10 @@ import traceback
 from typing import Any
 
 from langchain_community.chat_models import ChatLiteLLM
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.chat_history import InMemoryChatMessageHistory
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables.history import RunnableWithMessageHistory
 
 from config import settings
 from schemas import (
@@ -29,17 +32,49 @@ from safety import validate_actions
 
 logger = logging.getLogger(__name__)
 
+# ── Session Store ──────────────────────────────────────────
+# Global dict: session_id → InMemoryChatMessageHistory
+# Each session remembers all planner turns (DOM snapshots + LLM replies)
+
+_session_store: dict[str, InMemoryChatMessageHistory] = {}
+
+
+def get_session_history(session_id: str) -> InMemoryChatMessageHistory:
+    """Get or create chat history for a session."""
+    if session_id not in _session_store:
+        _session_store[session_id] = InMemoryChatMessageHistory()
+        logger.info(f"New session created: {session_id}")
+    return _session_store[session_id]
+
+
+def clear_session(session_id: str) -> bool:
+    """Clear memory for a session. Returns True if session existed."""
+    if session_id in _session_store:
+        del _session_store[session_id]
+        logger.info(f"Session cleared: {session_id}")
+        return True
+    return False
+
+
+def list_sessions() -> list[str]:
+    """List all active session IDs."""
+    return list(_session_store.keys())
+
+
 # ── System prompt ──────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are a browser automation assistant. You control a user's Chrome tab by outputting JSON action plans.
 
 ## Rules:
-1. You receive a list of interactive DOM elements, each with a unique `id` (e.g. "el_0", "el_1").
+1. You receive a list of interactive DOM elements, each with a stable `id` (e.g. "input_mobile_3a8f2c", "btn_send_otp_7d2ea1").
 2. You MUST return a JSON object with an "actions" array. Each action references an element by its `id`.
 3. NEVER output raw CSS selectors — only use element IDs from the provided list.
 4. You may batch multiple actions in one response for efficiency.
 5. If you need user input (e.g. OTP), set `wait_for_user_input` to describe what you need.
 6. When the task is complete, include a `done` action and set `done: true`.
+7. Each element has a `context` field showing its form/section (e.g. "Login Form → OTP Verification"). Use this to understand what part of the page you are interacting with.
+8. You have MEMORY of previous turns. Check the conversation history before planning — do NOT repeat actions that already succeeded.
+9. If a field already has a value filled (check the `value` field), do NOT re-type into it.
 
 ## Action types:
 - `type`: Type text into an input field. Requires `element_id` and `value`.
@@ -53,20 +88,49 @@ SYSTEM_PROMPT = """You are a browser automation assistant. You control a user's 
 ## Response format (strict JSON only, no markdown):
 {
   "actions": [
-    {"type": "type", "element_id": "el_0", "value": "some text", "description": "Filling name field"},
-    {"type": "click", "element_id": "el_1", "description": "Clicking submit button"}
+    {"type": "type", "element_id": "input_mobile_3a8f2c", "value": "some text", "description": "Filling mobile number"},
+    {"type": "click", "element_id": "btn_send_otp_7d2ea1", "description": "Clicking send OTP button"}
   ],
   "message": "Brief status message for the user",
   "done": false,
   "wait_for_user_input": ""
 }
 
+## Few-shot examples:
+
+### Example 1: Fill a form field and submit
+User says: "fill my mobile number 8248007169 and click send OTP"
+Elements: input_mobile_3a8f2c (input, placeholder="Mobile No."), btn_send_otp_7d2ea1 (button, text="Send OTP")
+You respond:
+{"actions": [{"type": "type", "element_id": "input_mobile_3a8f2c", "value": "8248007169", "description": "Filling mobile number"}, {"type": "click", "element_id": "btn_send_otp_7d2ea1", "description": "Clicking Send OTP"}], "message": "Filling mobile number and sending OTP.", "done": false, "wait_for_user_input": ""}
+
+### Example 2: Wait for user OTP input
+Elements show an OTP field: input_otp_verify_9b3c1d (input, ⚠️ OTP_FIELD)
+You respond:
+{"actions": [], "message": "OTP field detected. Please enter your OTP.", "done": false, "wait_for_user_input": "Please enter the OTP sent to your mobile number"}
+
+### Example 3: Select a dropdown option
+User says: "choose gandhi nagar statue hall"
+Elements: sel_area_name_a1b2c3 (select, label="Area"), sel_function_hall_d4e5f6 (select, label="Function Hall Name")
+You respond:
+{"actions": [{"type": "select", "element_id": "sel_area_name_a1b2c3", "value": "Gandhi Nagar", "description": "Selecting area"}, {"type": "select", "element_id": "sel_function_hall_d4e5f6", "value": "Statue Hall", "description": "Selecting function hall"}], "message": "Selecting Gandhi Nagar area and Statue Hall.", "done": false, "wait_for_user_input": ""}
+
 ## Safety:
-- NEVER interact with password or payment fields.
 - NEVER click buttons that say: "Delete Account", "Remove", "Deactivate".
 - If unsure what an element does, ask the user via `wait_for_user_input`.
 """
 
+
+# ── Prompt Template ────────────────────────────────────────
+
+prompt = ChatPromptTemplate.from_messages([
+    SystemMessage(content=SYSTEM_PROMPT),
+    MessagesPlaceholder(variable_name="history"),  # LangChain injects past turns here
+    ("human", "{input}"),                           # Current turn's user prompt
+])
+
+
+# ── Element Formatting ────────────────────────────────────
 
 def _format_elements(elements: list[DOMElement]) -> str:
     """Format elements list for the LLM prompt."""
@@ -88,6 +152,8 @@ def _format_elements(elements: list[DOMElement]) -> str:
             parts.append(f"name={el.name}")
         if el.value:
             parts.append(f'value="{el.value}"')
+        if el.context:
+            parts.append(f'context="{el.context}"')
         if el.disabled:
             parts.append("DISABLED")
         if el.otp_detected:
@@ -109,7 +175,7 @@ def _format_results(results: list[dict[str, Any]]) -> str:
 
 
 def _build_user_prompt(req: PlanRequest) -> str:
-    """Build the user message for the LLM."""
+    """Build the user message for the current turn."""
     parts = [
         f"Page: {req.page_url}",
         f"Title: {req.page_title}",
@@ -149,24 +215,59 @@ def _parse_llm_response(content: str) -> dict[str, Any]:
     return json.loads(content)
 
 
+# ── LLM Chain (created once, reused) ──────────────────────
+
+_llm = None
+_chain_with_history = None
+
+
+def _get_chain():
+    """Lazily create the LLM chain with history. Created once on first call."""
+    global _llm, _chain_with_history
+
+    if _chain_with_history is not None:
+        return _chain_with_history
+
+    model_name = settings.llm_model
+    logger.info(f"Creating LLM chain: {model_name}")
+
+    _llm = ChatLiteLLM(
+        model=model_name,
+        temperature=0,  # Deterministic for planning
+    )
+
+    # prompt | llm = the runnable chain
+    chain = prompt | _llm
+
+    # Wrap with session history
+    _chain_with_history = RunnableWithMessageHistory(
+        chain,
+        get_session_history,
+        input_messages_key="input",
+        history_messages_key="history",
+    )
+
+    return _chain_with_history
+
+
+# ── Main Planner ──────────────────────────────────────────
+
 async def plan_actions(req: PlanRequest) -> PlanResponse:
     """Generate an action plan from the DOM snapshot + user message.
 
-    Returns a PlanResponse with validated, safe actions.
+    Uses LangChain's RunnableWithMessageHistory so the LLM
+    remembers all prior turns within the same session_id.
     """
     try:
-        # Build LLM messages
-        messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=_build_user_prompt(req)),
-        ]
+        chain = _get_chain()
+        user_prompt = _build_user_prompt(req)
 
-        # Call LLM
-        model_name = settings.llm_model
-        llm = ChatLiteLLM(model=model_name)
-        logger.info(f"Calling LLM: {model_name}")
+        # Config tells RunnableWithMessageHistory which session to use
+        config = {"configurable": {"session_id": req.session_id}}
 
-        response = llm.invoke(messages)
+        logger.info(f"Calling LLM for session '{req.session_id}'")
+        response = chain.invoke({"input": user_prompt}, config=config)
+
         raw = str(response.content).strip()
         logger.debug(f"LLM raw response: {raw[:500]}")
 
@@ -175,11 +276,9 @@ async def plan_actions(req: PlanRequest) -> PlanResponse:
             data = _parse_llm_response(raw)
         except json.JSONDecodeError:
             logger.warning("LLM returned non-JSON, retrying with strict prompt")
-            # Retry with stricter prompt
-            messages.append(HumanMessage(
-                content="Your response was not valid JSON. Please respond with ONLY a JSON object, no explanation."
-            ))
-            response = llm.invoke(messages)
+            # Retry: add a correction message to history
+            retry_prompt = "Your response was not valid JSON. Please respond with ONLY a JSON object, no explanation."
+            response = chain.invoke({"input": retry_prompt}, config=config)
             raw = str(response.content).strip()
             data = _parse_llm_response(raw)
 

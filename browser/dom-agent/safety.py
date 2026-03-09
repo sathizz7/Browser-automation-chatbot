@@ -13,8 +13,8 @@ from schemas import ActionType, DOMAction, DOMElement
 logger = logging.getLogger(__name__)
 
 # ── Blocked patterns ───────────────────────────────────────
-
-_BLOCKED_INPUT_TYPES = {"password", "file"}
+#password -- add password if needed
+_BLOCKED_INPUT_TYPES = {"file"}
 
 _BLOCKED_NAME_PATTERNS = re.compile(
     r"(card.?num|cvv|cvc|expir|security.?code|ssn|social.?security)",

@@ -41,6 +41,7 @@ class DOMElement(BaseModel):
     name: str = Field(default="", description="HTML name attribute")
     value: str = Field(default="", description="Current value")
     aria_label: str = Field(default="", alias="ariaLabel")
+    context: str = Field(default="", description="Semantic context: form title, section heading")
     visible: bool = Field(default=True)
     disabled: bool = Field(default=False)
     otp_detected: bool = Field(default=False, description="Rule-based OTP field detection")
