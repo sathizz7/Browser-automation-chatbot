@@ -205,3 +205,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Playwright browser binaries cache
+.playwright/
+
+# Node.js (extension build tooling)
+node_modules/
